@@ -85,9 +85,27 @@ offline again.
 
 ## Flashing (until the panel does it)
 
-On the atom, with esptool installed and neond stopped (it holds the port):
-`./flash.sh signed/ /dev/ttyUSB0`. It keeps the signed bootloader's header as it is and writes the
-bootloader last.
+On the atom, neond stopped for the whole procedure (it holds the port, and gives up on a radio that
+did not answer until it is unplugged), esptool 4.8.1 in `/root/esptool` as on hq:
+
+0. **Check and back up** (only possible before stage B): `sha256sum -c SHA256SUMS` in the signed
+   folder; `espsecure.py signature_info_v2 bootloader.bin` shows two keys matching
+   `key-digests.hex`; `espefuse.py --chip esp32s3 -p /dev/ttyUSB0 summary` shows `SECURE_BOOT_EN` 0,
+   no key purposes, `WR_DIS_RD_DIS` 0; `esptool.py --chip esp32s3 -p /dev/ttyUSB0 read_flash 0 0x800000
+   heltec-stock.bin` keeps the whole board.
+1. **Stage A, nothing locked:** `./flash.sh app signed/`. The Neon firmware on the board's own
+   bootloader: start neond, check the radio works as before (same MeshCore identity), stop neond,
+   `neon-radio.py identity` answers (status 0x00).
+2. **Stage B, locks the board for good:** `./flash.sh lock signed/`. Its first start burns the keys'
+   digests and turns secure boot on. Wait 30 s, then `neon-radio.py identity` must show status
+   **0x17**. Anything else: stop and ask.
+3. **Provision:** `neon-radio.py provision` (minutes; nothing else on the port), then at once
+   `neon-radio.py backup DIR` and copy DIR to hq: the key's parameters are useless off this chip and
+   are the only way back if the radio's flash is ever wiped (`neon-radio.py restore DIR`).
+4. Start neond again.
+
+Never flash a merged MeshCore image or use a web flasher on a secured board: it overwrites the
+parameters (restore them from the backup).
 
 ## Licence
 
