@@ -19,22 +19,29 @@ companion radio for the atom (channels, direct messages, adverts), with Neon's u
 
 ## How it fits together
 
-1. **The atom flashes it** (panel: Reach → MeshCore → Secure this radio): the signed bootloader,
-   partition table and firmware, over the USB cable the Heltec is already on.
-2. **First start:** the bootloader burns the digest of the Neon firmware key and turns secure boot
-   on (it checks the firmware's signature first).
-3. **Provisioning** (`CMD_NEON`, `SUB_PROVISION`, sent by the atom): the firmware turns JTAG and the
-   full download mode off, makes an RSA-3072 key, encrypts it for the chip's digital signature
-   peripheral with a new HMAC key and burns that key into a read-protected eFuse; the private key
-   leaves RAM. It checks one signature before answering. A chip without secure boot refuses.
-4. **Every reception:** `PUSH_RX` (sequence, boot count, microsecond counter, RSSI, SNR, the
-   packet's SHA-256 fingerprint, the chip's MAC) and its signature in three `PUSH_RX_SIG` frames.
-   The atom passes them on unchanged; electrodes check them against the radio's public key, which
-   the atom registers signed with its own key (one rewarded radio per atom).
+1. **The atom flashes it** (panel, to come): the signed bootloader, partition table and firmware, over
+   the USB cable the Heltec is already on.
+2. **First start:** the bootloader checks the firmware's signature, burns the digests of the Neon firmware
+   key and its offline backup into the chip, revokes the third slot, turns secure boot on, turns JTAG off
+   and limits USB download to flash writes. From here the board is locked.
+3. **Provisioning** (`CMD_NEON`, `SUB_PROVISION`, once in the chip's life): the firmware checks that
+   secure boot trusts only Neon's two keys (revoking any other slot), burns the remaining protections
+   (soft JTAG, direct boot), makes an RSA-3072 key with the hardware random source on, saves its
+   encrypted parameters to flash and reads them back, then burns a new HMAC key read-protected for the
+   digital signature peripheral and locks read protection for good. A signature is checked before it
+   answers. A chip that already has a key refuses (flash erased by the atom: the key cannot be remade).
+4. **Every reception:** `PUSH_RX` (sequence, boot count, microsecond counter, RSSI, SNR, MeshCore's own
+   packet hash at full length, the chip's MAC, the radio's frequency, bandwidth, spreading factor and
+   coding rate, and the electrodes' latest freshness value set with `SUB_NONCE`) and its signature in
+   three `PUSH_RX_SIG` frames. The atom passes them on unchanged; electrodes check them against the
+   radio's public key, which the atom registers signed with its own key (one rewarded radio per atom),
+   and refuse stale freshness values.
 
 What it cannot prove: the chip has no factory attestation, so the network cannot tell a secured
 Heltec from software pretending to be one at registration. A fake still needs a genuine hotspot, a
 confirmed position, other operators' atoms hearing the same packets, and stays under the caps.
+Older Neon-signed firmware can be written back over a newer one (no anti-rollback yet **(verify**
+whether the Arduino build can carry a secure version**)**).
 
 ## Build
 
@@ -46,16 +53,24 @@ Needs PlatformIO (`pip install platformio`). `neon/companion_radio.patch` is the
 MeshCore's own files (two hooks, behind `NEON_RADIO`); `neon/NeonRadio.cpp` is the rest. MeshCore's
 private key import and export are compiled out.
 
-## The firmware key (hq)
+## The firmware keys (hq)
 
-Made once, on hq, and backed up offline (losing it ends updates for every secured radio):
+Two keys, made once on hq: the project's key (stays on hq) and a backup key (moved offline at once,
+brought back only to sign a bootloader or to replace a lost or stolen project key). Every secured
+radio trusts exactly these two, for good.
 
 ```
-pip install esptool==4.8.1 && espsecure.py generate_signing_key --version 2 --scheme rsa3072 /root/neon-firmware-key.pem && chmod 600 /root/neon-firmware-key.pem
+sudo /root/esptool/bin/espsecure.py generate_signing_key --version 2 --scheme rsa3072 /root/neon-firmware-backup-key.pem && sudo chmod 600 /root/neon-firmware-backup-key.pem
 ```
 
-Signing a build: `./sign.sh /root/neon-firmware-key.pem out/ signed/` (signs, verifies, writes the
-flash layout and SHA256SUMS).
+Their digests (public) go into `neon/key-digests.hex`, one per line; the build refuses without it:
+
+```
+for k in /root/neon-firmware-key.pem /root/neon-firmware-backup-key.pem; do sudo /root/esptool/bin/espsecure.py digest_sbv2_public_key --keyfile $k -o /tmp/d.bin >/dev/null && od -An -tx1 -v /tmp/d.bin | tr -d ' \n' && echo; done; rm -f /tmp/d.bin
+```
+
+Signing a build: `./sign.sh /root/neon-firmware-key.pem /root/neon-firmware-backup-key.pem out/ signed/`
+(signs, verifies, writes the flash layout and SHA256SUMS).
 
 ## Licence
 

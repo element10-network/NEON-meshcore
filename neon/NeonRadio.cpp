@@ -9,6 +9,8 @@
 #include <Packet.h>
 #include <helpers/BaseSerialInterface.h>
 
+#include "KeyDigest.h"  // NEON_KEY_DIGESTS: the project's firmware keys (build.sh, from key-digests.hex)
+#include "bootloader_random.h"
 #include "esp_efuse.h"
 #include "esp_efuse_table.h"
 #include "esp_random.h"
@@ -25,21 +27,57 @@ namespace neon {
 namespace {
 
 const char* NS = "neon";
-const char* DOMAIN = "neon-mc-rx/1";
+const char* DOMAIN = "neon-mc-rx/2";
 
-// The key: loaded once (DS parameters, their eFuse block, the modulus).
+// The key. The chip's eFuses are the truth: the block with the DS purpose is the key; flash only
+// holds its encrypted parameters and modulus, checked with a signature when loaded.
 struct Key {
   bool loaded = false;
-  bool present = false;
+  bool present = false;  // usable: parameters loaded and checked
+  bool lost = false;     // the chip has a DS key block, but no matching parameters
   esp_ds_data_t ds;
-  uint8_t block = 0;           // HMAC key id (0..5: EFUSE_BLK_KEY0..5)
+  uint8_t block = 0;     // HMAC key id (0..5: EFUSE_BLK_KEY0..5)
   uint8_t modulus[RSA_BYTES];  // big-endian
 };
 Key key;
 uint32_t boot = 0;
 uint32_t seq = 0;
+uint8_t nonce[16] = {0};
 
 bool fuse(const esp_efuse_desc_t* field[]) { return esp_efuse_read_field_bit(field); }
+
+bool burn(const esp_efuse_desc_t* field[]) {
+  return fuse(field) || (esp_efuse_write_field_bit(field) == ESP_OK && fuse(field));
+}
+
+// The block holding a DS key, if any.
+int dsBlock() {
+  for (int b = EFUSE_BLK_KEY0; b < EFUSE_BLK_KEY_MAX; b++)
+    if (esp_efuse_get_key_purpose((esp_efuse_block_t)b) == ESP_EFUSE_KEY_PURPOSE_HMAC_DOWN_DIGITAL_SIGNATURE) return b;
+  return -1;
+}
+
+// Secure boot trusts only Neon's keys: each of the three digest slots holds one of
+// NEON_KEY_DIGESTS or is revoked. `fix` revokes (for good) any other slot.
+bool digestsOk(bool fix) {
+  static const uint8_t ALLOWED[][32] = NEON_KEY_DIGESTS;
+  const int n = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
+  for (unsigned slot = 0; slot < 3; slot++) {
+    if (esp_efuse_get_digest_revoke(slot)) continue;
+    bool ours = false;
+    for (int b = EFUSE_BLK_KEY0; b < EFUSE_BLK_KEY_MAX && !ours; b++) {
+      if (esp_efuse_get_key_purpose((esp_efuse_block_t)b) !=
+          (esp_efuse_purpose_t)(ESP_EFUSE_KEY_PURPOSE_SECURE_BOOT_DIGEST0 + slot))
+        continue;
+      uint8_t d[32];
+      if (esp_efuse_read_block((esp_efuse_block_t)b, d, 0, 256) != ESP_OK) continue;
+      for (int k = 0; k < n && !ours; k++) ours = memcmp(d, ALLOWED[k], 32) == 0;
+    }
+    if (ours) continue;
+    if (!fix || esp_efuse_set_digest_revoke(slot) != ESP_OK || !esp_efuse_get_digest_revoke(slot)) return false;
+  }
+  return true;
+}
 
 uint8_t status() {
   uint8_t s = 0;
@@ -47,21 +85,9 @@ uint8_t status() {
   if (fuse(ESP_EFUSE_HARD_DIS_JTAG) && fuse(ESP_EFUSE_DIS_USB_JTAG)) s |= ST_JTAG_OFF;
   if (fuse(ESP_EFUSE_ENABLE_SECURITY_DOWNLOAD) || fuse(ESP_EFUSE_DIS_DOWNLOAD_MODE)) s |= ST_SECURE_DOWNLOAD;
   if (key.present) s |= ST_KEY;
+  if (digestsOk(false)) s |= ST_DIGESTS;
+  if (key.lost) s |= ST_KEY_LOST;
   return s;
-}
-
-void load() {
-  if (key.loaded) return;
-  key.loaded = true;
-  Preferences p;
-  p.begin(NS, false);
-  boot = p.getUInt("boot", 0) + 1;
-  p.putUInt("boot", boot);
-  key.present = p.getBytesLength("ds") == sizeof(esp_ds_data_t) && p.getBytesLength("mod") == RSA_BYTES &&
-                p.getBytes("ds", &key.ds, sizeof(key.ds)) == sizeof(key.ds) &&
-                p.getBytes("mod", key.modulus, RSA_BYTES) == RSA_BYTES;
-  key.block = p.getUChar("blk", 0);
-  p.end();
 }
 
 void reverse(uint8_t* b, int n) {
@@ -87,12 +113,52 @@ void encode(const uint8_t hash[32], uint8_t em[RSA_BYTES]) {
 }
 
 // Sign a SHA-256 hash with the chip's key; the signature big-endian.
-bool sign(const uint8_t hash[32], uint8_t sig[RSA_BYTES]) {
+bool sign(const esp_ds_data_t& ds, uint8_t block, const uint8_t hash[32], uint8_t sig[RSA_BYTES]) {
   static uint8_t em[RSA_BYTES];
   encode(hash, em);
-  if (esp_ds_sign(em, &key.ds, (hmac_key_id_t)key.block, sig) != ESP_OK) return false;
+  if (esp_ds_sign(em, &ds, (hmac_key_id_t)block, sig) != ESP_OK) return false;
   reverse(sig, RSA_BYTES);
   return true;
+}
+
+// A fresh signature verifies with the modulus: the parameters and the chip's key belong together.
+bool selfTest(const esp_ds_data_t& ds, uint8_t block, const uint8_t mod[RSA_BYTES]) {
+  uint8_t hash[32];
+  static uint8_t sig[RSA_BYTES];
+  esp_fill_random(hash, 32);
+  mbedtls_rsa_context pub;
+  mbedtls_rsa_init(&pub, MBEDTLS_RSA_PKCS_V15, 0);
+  mbedtls_mpi N, E;
+  mbedtls_mpi_init(&N);
+  mbedtls_mpi_init(&E);
+  bool ok = sign(ds, block, hash, sig) && mbedtls_mpi_read_binary(&N, mod, RSA_BYTES) == 0 &&
+            mbedtls_mpi_lset(&E, 65537) == 0 &&
+            mbedtls_rsa_import(&pub, &N, nullptr, nullptr, nullptr, &E) == 0 && mbedtls_rsa_complete(&pub) == 0 &&
+            mbedtls_rsa_pkcs1_verify(&pub, nullptr, nullptr, MBEDTLS_RSA_PUBLIC, MBEDTLS_MD_SHA256, 32, hash, sig) == 0;
+  mbedtls_rsa_free(&pub);
+  mbedtls_mpi_free(&N);
+  mbedtls_mpi_free(&E);
+  return ok;
+}
+
+void load() {
+  if (key.loaded) return;
+  key.loaded = true;
+  Preferences p;
+  p.begin(NS, false);
+  boot = p.getUInt("boot", 0) + 1;
+  p.putUInt("boot", boot);
+  int blk = dsBlock();
+  if (blk >= 0) {
+    bool read = p.getBytesLength("ds") == sizeof(esp_ds_data_t) && p.getBytesLength("mod") == RSA_BYTES &&
+                p.getBytes("ds", &key.ds, sizeof(key.ds)) == sizeof(key.ds) &&
+                p.getBytes("mod", key.modulus, RSA_BYTES) == RSA_BYTES;
+    key.block = blk - EFUSE_BLK_KEY0;
+    key.present = read && esp_efuse_get_key_dis_read((esp_efuse_block_t)blk) &&
+                  selfTest(key.ds, key.block, key.modulus);
+    key.lost = !key.present;
+  }
+  p.end();
 }
 
 int rng(void*, unsigned char* out, size_t len) {
@@ -109,11 +175,11 @@ int error(uint8_t* out, uint8_t code, const char* text) {
   return 2 + n;
 }
 
-// RESP_IDENTITY: [0xE1][version][status][mac 6][boot u32][key block][modulus sha256 32]
+// RESP_IDENTITY: [0xE1][version 2][status][mac 6][boot u32][key block][modulus sha256 32]
 int identity(uint8_t* out) {
   int i = 0;
   out[i++] = RESP_IDENTITY;
-  out[i++] = 1;
+  out[i++] = 2;
   out[i++] = status();
   esp_efuse_mac_get_default(out + i);
   i += 6;
@@ -130,118 +196,124 @@ int identity(uint8_t* out) {
   return i + 32;
 }
 
-bool burn(const esp_efuse_desc_t* field[]) {
-  return fuse(field) || (esp_efuse_write_field_bit(field) == ESP_OK && fuse(field));
-}
-
-// Lock the chip and make the key. Only on a chip that boots Neon-signed firmware alone (secure
-// boot), with JTAG off and ROM download limited to flash writes, so no other code can ever use
-// the key. Takes a minute or two (RSA-3072 key generation).
+// Lock the chip and make the key, once in the chip's life. Only on a chip that starts Neon-signed
+// firmware alone (secure boot, only Neon's key digests), with JTAG off and ROM download limited to
+// flash writes, so no other code can ever use the key. Takes a minute or two (RSA-3072 key
+// generation): the atom waits for the answer.
 int provision(uint8_t* out) {
   if (key.present) return identity(out);
+  if (key.lost) return error(out, 8, "this chip's key was made before and its parameters are gone: it cannot be used again");
+  if (dsBlock() >= 0) return error(out, 8, "this chip already has a key");
   if (!esp_secure_boot_enabled())
     return error(out, 1, "secure boot is off: flash the Neon bootloader first");
-  if (!burn(ESP_EFUSE_HARD_DIS_JTAG) || !burn(ESP_EFUSE_DIS_USB_JTAG) ||
+  if (!digestsOk(true)) return error(out, 9, "secure boot trusts a key that is not Neon's");
+  if (!burn(ESP_EFUSE_HARD_DIS_JTAG) || !burn(ESP_EFUSE_DIS_USB_JTAG) || !burn(ESP_EFUSE_SOFT_DIS_JTAG) ||
+      !burn(ESP_EFUSE_DIS_DIRECT_BOOT) ||
       !(fuse(ESP_EFUSE_DIS_DOWNLOAD_MODE) || burn(ESP_EFUSE_ENABLE_SECURITY_DOWNLOAD)))
-    return error(out, 2, "could not turn JTAG and full download mode off");
+    return error(out, 2, "could not turn JTAG, direct boot and full download mode off");
+  // Read protection must still be possible (the Neon bootloader leaves it so).
+  if (fuse(ESP_EFUSE_WR_DIS_RD_DIS)) return error(out, 3, "read protection is locked on this chip: no key can be kept secret");
   esp_efuse_block_t blk = esp_efuse_find_unused_key_block();
   if (blk == EFUSE_BLK_KEY_MAX) return error(out, 3, "no free eFuse key block");
 
   static esp_ds_p_data_t p;
   memset(&p, 0, sizeof(p));
+  uint8_t hmac[32], iv[ESP_DS_IV_LEN];
   mbedtls_rsa_context rsa;
   mbedtls_rsa_init(&rsa, MBEDTLS_RSA_PKCS_V15, 0);
   mbedtls_mpi N, D, rr, inv, m32;
   mbedtls_mpi_init(&N); mbedtls_mpi_init(&D); mbedtls_mpi_init(&rr); mbedtls_mpi_init(&inv); mbedtls_mpi_init(&m32);
-  bool ok = mbedtls_rsa_gen_key(&rsa, rng, nullptr, RSA_BYTES * 8, 65537) == 0 &&
-            mbedtls_rsa_export(&rsa, &N, nullptr, nullptr, &D, nullptr) == 0 &&
-            // Rb = 2^(2 * bits) mod N; M' = -N^-1 mod 2^32 (IDF's configure_ds.py).
-            mbedtls_mpi_lset(&rr, 1) == 0 && mbedtls_mpi_shift_l(&rr, RSA_BYTES * 8 * 2) == 0 &&
-            mbedtls_mpi_mod_mpi(&rr, &rr, &N) == 0 &&
-            mbedtls_mpi_lset(&m32, 1) == 0 && mbedtls_mpi_shift_l(&m32, 32) == 0 &&
-            mbedtls_mpi_inv_mod(&inv, &N, &m32) == 0 &&
-            mbedtls_mpi_write_binary_le(&D, (unsigned char*)p.Y, RSA_BYTES) == 0 &&
-            mbedtls_mpi_write_binary_le(&N, (unsigned char*)p.M, RSA_BYTES) == 0 &&
-            mbedtls_mpi_write_binary_le(&rr, (unsigned char*)p.Rb, RSA_BYTES) == 0 &&
-            mbedtls_mpi_write_binary(&N, key.modulus, RSA_BYTES) == 0;
+  // True random numbers: no Wi-Fi or Bluetooth runs in this build, so the RNG's entropy source is
+  // turned on for the keys.
+  bootloader_random_enable();
+  bool ok = mbedtls_rsa_gen_key(&rsa, rng, nullptr, RSA_BYTES * 8, 65537) == 0;
+  esp_fill_random(hmac, sizeof(hmac));
+  esp_fill_random(iv, sizeof(iv));
+  bootloader_random_disable();
+  ok = ok && mbedtls_rsa_export(&rsa, &N, nullptr, nullptr, &D, nullptr) == 0 &&
+       // Rb = 2^(2 * bits) mod N; M' = -N^-1 mod 2^32 (IDF's configure_ds.py).
+       mbedtls_mpi_lset(&rr, 1) == 0 && mbedtls_mpi_shift_l(&rr, RSA_BYTES * 8 * 2) == 0 &&
+       mbedtls_mpi_mod_mpi(&rr, &rr, &N) == 0 &&
+       mbedtls_mpi_lset(&m32, 1) == 0 && mbedtls_mpi_shift_l(&m32, 32) == 0 &&
+       mbedtls_mpi_inv_mod(&inv, &N, &m32) == 0 &&
+       mbedtls_mpi_write_binary_le(&D, (unsigned char*)p.Y, RSA_BYTES) == 0 &&
+       mbedtls_mpi_write_binary_le(&N, (unsigned char*)p.M, RSA_BYTES) == 0 &&
+       mbedtls_mpi_write_binary_le(&rr, (unsigned char*)p.Rb, RSA_BYTES) == 0 &&
+       mbedtls_mpi_write_binary(&N, key.modulus, RSA_BYTES) == 0;
   if (ok) {
     uint32_t i32 = 0;
     mbedtls_mpi_write_binary_le(&inv, (unsigned char*)&i32, 4);
     p.M_prime = (uint32_t)(0u - i32);
     p.length = ESP_DS_RSA_3072;
+    ok = esp_ds_encrypt_params(&key.ds, iv, &p, hmac) == ESP_OK;
   }
   // The private exponent leaves RAM now, whatever happens below.
+  memset(&p, 0, sizeof(p));
   mbedtls_rsa_free(&rsa);
-  mbedtls_mpi_free(&D); mbedtls_mpi_free(&rr); mbedtls_mpi_free(&inv); mbedtls_mpi_free(&m32);
+  mbedtls_mpi_free(&N); mbedtls_mpi_free(&D); mbedtls_mpi_free(&rr); mbedtls_mpi_free(&inv); mbedtls_mpi_free(&m32);
   if (!ok) {
-    mbedtls_mpi_free(&N);
-    memset(&p, 0, sizeof(p));
+    memset(hmac, 0, sizeof(hmac));
     return error(out, 4, "key generation failed");
   }
-  uint8_t hmac[32], iv[ESP_DS_IV_LEN];
-  esp_fill_random(hmac, sizeof(hmac));
-  esp_fill_random(iv, sizeof(iv));
-  ok = esp_ds_encrypt_params(&key.ds, iv, &p, hmac) == ESP_OK;
-  memset(&p, 0, sizeof(p));
-  // Burnt read-protected: only the DS peripheral can use it from now on.
-  ok = ok && esp_efuse_write_key(blk, ESP_EFUSE_KEY_PURPOSE_HMAC_DOWN_DIGITAL_SIGNATURE, hmac, sizeof(hmac)) == ESP_OK;
-  memset(hmac, 0, sizeof(hmac));
-  if (!ok) {
-    mbedtls_mpi_free(&N);
-    return error(out, 5, "the key could not be stored in the chip");
-  }
-  if (!esp_efuse_get_key_dis_read(blk)) esp_efuse_set_key_dis_read(blk);
-  key.block = blk - EFUSE_BLK_KEY0;
 
-  // Check: a signature made by the chip verifies with the public key.
-  uint8_t hash[32], sig[RSA_BYTES];
-  esp_fill_random(hash, 32);
-  mbedtls_rsa_context pub;
-  mbedtls_rsa_init(&pub, MBEDTLS_RSA_PKCS_V15, 0);
-  mbedtls_mpi E;
-  mbedtls_mpi_init(&E);
-  mbedtls_mpi_lset(&E, 65537);
-  ok = sign(hash, sig) && mbedtls_rsa_import(&pub, &N, nullptr, nullptr, nullptr, &E) == 0 &&
-       mbedtls_rsa_complete(&pub) == 0 &&
-       mbedtls_rsa_pkcs1_verify(&pub, nullptr, nullptr, MBEDTLS_RSA_PUBLIC, MBEDTLS_MD_SHA256, 32, hash, sig) == 0;
-  mbedtls_rsa_free(&pub);
-  mbedtls_mpi_free(&E);
-  mbedtls_mpi_free(&N);
-  if (!ok) return error(out, 6, "the chip's signature did not verify");
-
+  // Saved (and read back) before anything is burnt: a reset after the burn finds them.
   Preferences pr;
   pr.begin(NS, false);
-  pr.putBytes("ds", &key.ds, sizeof(key.ds));
-  pr.putBytes("mod", key.modulus, RSA_BYTES);
-  pr.putUChar("blk", key.block);
+  static esp_ds_data_t back;
+  static uint8_t mod_back[RSA_BYTES];
+  ok = pr.putBytes("ds", &key.ds, sizeof(key.ds)) == sizeof(key.ds) &&
+       pr.putBytes("mod", key.modulus, RSA_BYTES) == RSA_BYTES &&
+       pr.getBytes("ds", &back, sizeof(back)) == sizeof(back) && memcmp(&back, &key.ds, sizeof(back)) == 0 &&
+       pr.getBytes("mod", mod_back, RSA_BYTES) == RSA_BYTES && memcmp(mod_back, key.modulus, RSA_BYTES) == 0;
   pr.end();
+  if (!ok) {
+    memset(hmac, 0, sizeof(hmac));
+    return error(out, 5, "the key could not be saved");
+  }
+
+  // Burnt read-protected: only the DS peripheral can use it from now on.
+  ok = esp_efuse_write_key(blk, ESP_EFUSE_KEY_PURPOSE_HMAC_DOWN_DIGITAL_SIGNATURE, hmac, sizeof(hmac)) == ESP_OK;
+  memset(hmac, 0, sizeof(hmac));
+  if (!esp_efuse_get_key_dis_read(blk)) esp_efuse_set_key_dis_read(blk);
+  if (!ok || !esp_efuse_get_key_dis_read(blk)) {
+    key.lost = true;
+    return error(out, 6, "the key could not be stored read-protected in the chip");
+  }
+  // From now on no key can be read-protected or unprotected again.
+  burn(ESP_EFUSE_WR_DIS_RD_DIS);
+  key.block = blk - EFUSE_BLK_KEY0;
+  if (!selfTest(key.ds, key.block, key.modulus)) {
+    key.lost = true;
+    return error(out, 7, "the chip's signature did not verify");
+  }
   key.present = true;
   return identity(out);
 }
 
 }  // namespace
 
-void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterface* serial) {
+void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterface* serial, RadioParams radio) {
   load();
   if (!key.present || serial == nullptr || !serial->isConnected()) return;
   mesh::Packet pkt;
-  if (len <= 0 || !pkt.readFrom(raw, len)) return;
+  // Only what MeshCore itself would take (its parser refuses newer payload versions).
+  if (len <= 0 || !pkt.readFrom(raw, len) || pkt.getPayloadVer() > PAYLOAD_VER_1) return;
 
-  // The packet's fingerprint, as MeshCore's own packet hash (payload type, payload; the path
-  // length for traces), at full length.
+  // The packet's fingerprint, exactly as MeshCore's own packet hash (payload type, the path length
+  // as stored for traces, the payload), at full length.
   uint8_t fp[32];
   {
     SHA256 h;
     uint8_t t = pkt.getPayloadType();
     h.update(&t, 1);
-    if (t == PAYLOAD_TYPE_TRACE) h.update(&pkt.path_len, 1);
+    if (t == PAYLOAD_TYPE_TRACE) h.update(&pkt.path_len, sizeof(pkt.path_len));
     h.update(pkt.payload, pkt.payload_len);
     h.finalize(fp, 32);
   }
   uint8_t rx[RX_LEN];
   int i = 0;
   rx[i++] = PUSH_RX;
-  rx[i++] = 1;
+  rx[i++] = 2;
   seq++;
   memcpy(rx + i, &seq, 4); i += 4;
   memcpy(rx + i, &boot, 4); i += 4;
@@ -252,6 +324,11 @@ void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterfa
   rx[i++] = (uint8_t)(int8_t)(s4 < -128 ? -128 : s4 > 127 ? 127 : s4);
   memcpy(rx + i, fp, 32); i += 32;
   esp_efuse_mac_get_default(rx + i); i += 6;
+  memcpy(rx + i, &radio.freq, 4); i += 4;
+  memcpy(rx + i, &radio.bw, 4); i += 4;
+  rx[i++] = radio.sf;
+  rx[i++] = radio.cr;
+  memcpy(rx + i, nonce, 16); i += 16;
 
   uint8_t hash[32];
   {
@@ -261,7 +338,7 @@ void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterfa
     h.finalize(hash, 32);
   }
   static uint8_t sig[RSA_BYTES];
-  if (!sign(hash, sig)) return;
+  if (!sign(key.ds, key.block, hash, sig)) return;
   serial->writeFrame(rx, RX_LEN);
   uint8_t part[6 + 128];
   for (uint8_t k = 0; k < 3; k++) {
@@ -282,12 +359,16 @@ int command(const uint8_t* frame, int len, uint8_t* out) {
     case SUB_PROVISION:
       return provision(out);
     case SUB_PUBKEY:
-      if (!key.present) return error(out, 7, "no key yet");
+      if (!key.present) return error(out, 7, "no key");
       if (len < 3 || frame[2] > 2) return error(out, 0, "part 0 to 2");
       out[0] = RESP_PUBKEY;
       out[1] = frame[2];
       memcpy(out + 2, key.modulus + 128 * frame[2], 128);
       return 2 + 128;
+    case SUB_NONCE:
+      if (len < 18) return error(out, 0, "16 bytes");
+      memcpy(nonce, frame + 2, 16);
+      return identity(out);
     default:
       return error(out, 0, "unknown subcommand");
   }

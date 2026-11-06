@@ -17,7 +17,7 @@ index f32ea67..6b26362 100644
  
  void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 +#ifdef NEON_RADIO
-+  neon::onRx(snr, rssi, raw, len, _serial);
++  neon::onRx(snr, rssi, raw, len, _serial, neon::RadioParams{_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr});
 +#endif
    if (_serial->isConnected() && len + 3 <= MAX_FRAME_SIZE) {
      int i = 0;
