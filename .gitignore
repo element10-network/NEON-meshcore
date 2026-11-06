@@ -1,0 +1,7 @@
+build/
+out/
+signed/
+.pio/
+*.pem
+bootloader/sdkconfig.bootloader
+bootloader/.pio/
