@@ -83,6 +83,16 @@ the unsigned files against build.sh's list, refuses files signed before, checks 
 `key-digests.hex`, signs, verifies and writes the flash layout and SHA256SUMS. Then move the backup key
 offline again.
 
+## Releases (GitHub)
+
+`Radio` workflow (`.github/workflows/radio.yml`, run by hand): builds, signs the firmware with the project key
+(repository secret `NEON_FIRMWARE_KEY`), adds the bootloader signed once on hq (`release/bootloader.bin`, checked
+by `release/check-bootloader.py` against `release/bootloader-unsigned.bin` and `key-digests.hex`) and publishes
+a release with `SHA256SUMS` and `radio.txt`. The atom's panel flashes and locks the radio from it.
+
+The bootloader is signed again only when `bootloader/` changes: build, commit the new
+`release/bootloader-unsigned.bin`, sign it on hq with both keys (`sign.sh`), commit `release/bootloader.bin`.
+
 ## Flashing (until the panel does it)
 
 On the atom, neond stopped for the whole procedure (it holds the port, and gives up on a radio that

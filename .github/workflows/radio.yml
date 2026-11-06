@@ -1,0 +1,53 @@
+# Builds, signs and publishes the secured radio firmware (README). Run by hand ("publish the
+# radio"): about 5 Actions minutes. The firmware is signed with the project key (secret
+# NEON_FIRMWARE_KEY, the same trust as NEON's release key); the bootloader is the one signed once on hq
+# with both keys (release/bootloader.bin), checked against its source build and key-digests.hex.
+name: Radio
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  radio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install -q platformio==6.2.0 esptool==4.8.1
+      - name: Check the signed bootloader
+        run: python3 release/check-bootloader.py "$(command -v espsecure.py)"
+      - name: Build
+        run: ./build.sh
+      - name: Sign the firmware
+        env:
+          KEY: ${{ secrets.NEON_FIRMWARE_KEY }}
+        run: |
+          set -eu
+          umask 077
+          k="$RUNNER_TEMP/key.pem"
+          printf '%s\n' "$KEY" > "$k"
+          espsecure.py digest_sbv2_public_key --keyfile "$k" --output "$RUNNER_TEMP/d.bin" >/dev/null
+          [ "$(od -An -tx1 -v "$RUNNER_TEMP/d.bin" | tr -d ' \n')" = "$(sed -n 1p neon/key-digests.hex)" ] || { echo "NEON_FIRMWARE_KEY is not the project key of key-digests.hex"; rm -f "$k"; exit 1; }
+          if espsecure.py signature_info_v2 out/firmware.bin >/dev/null 2>&1; then echo "already signed"; exit 1; fi
+          mkdir -p dist
+          espsecure.py sign_data --version 2 --keyfile "$k" --output dist/firmware.bin out/firmware.bin >/dev/null
+          r=$(espsecure.py verify_signature --version 2 --keyfile "$k" dist/firmware.bin 2>&1) || true
+          rm -f "$k"
+          printf '%s' "$r" | grep -q "verification successful"
+      - name: Release files
+        run: |
+          set -eu
+          v=$(cat VERSION)
+          cp release/bootloader.bin out/partitions.bin out/boot_app0.bin neon/key-digests.hex dist/
+          printf '0x10000 firmware.bin\n0x8000 partitions.bin\n0xe000 boot_app0.bin\n0x0 bootloader.bin\n' > dist/layout.txt
+          printf 'neon-radio/1\nversion %s\ncommit %s\nboard heltec-v3\n' "$v" "$(git rev-parse --short HEAD)" > dist/radio.txt
+          (cd dist && sha256sum bootloader.bin partitions.bin boot_app0.bin firmware.bin key-digests.hex layout.txt radio.txt > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(cat VERSION)
+          gh release create "radio-v$v-$(git rev-parse --short HEAD)" dist/* --title "Neon radio $v (Heltec V3)" --notes "Signed firmware for the secured MeshCore radio. Flashed and locked from the atom's panel."
