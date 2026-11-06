@@ -48,6 +48,7 @@ uint8_t nonce[16] = {0};
 bool nonceSet = false;
 struct {
   bool ok = false;
+  uint32_t changed_ms = 0;
   float freq = 0, bw = 0;
   uint8_t sf = 0, cr = 0;
 } radio;
@@ -92,15 +93,19 @@ bool digestsOk(bool fix) {
       holds[slot] = -1;
       continue;
     }
-    for (int b = EFUSE_BLK_KEY0; b < EFUSE_BLK_KEY_MAX && holds[slot] == 0; b++) {
-      if (esp_efuse_get_key_purpose((esp_efuse_block_t)b) !=
-          (esp_efuse_purpose_t)(ESP_EFUSE_KEY_PURPOSE_SECURE_BOOT_DIGEST0 + slot))
-        continue;
-      uint8_t d[32];
-      if (esp_efuse_read_block((esp_efuse_block_t)b, d, 0, 256) != ESP_OK) continue;
-      for (int k = 0; k < 2 && holds[slot] == 0; k++)
-        if (memcmp(d, ALLOWED[k], 32) == 0) holds[slot] = k + 1;
-    }
+    // As the ROM and the bootloader read it: the first block with this slot's purpose. A second
+    // block with the same purpose is refused outright (a foreign key could hide behind ours).
+    const esp_efuse_purpose_t purpose = (esp_efuse_purpose_t)(ESP_EFUSE_KEY_PURPOSE_SECURE_BOOT_DIGEST0 + slot);
+    int count = 0;
+    for (int b = EFUSE_BLK_KEY0; b < EFUSE_BLK_KEY_MAX; b++)
+      if (esp_efuse_get_key_purpose((esp_efuse_block_t)b) == purpose) count++;
+    if (count > 1) return false;
+    esp_efuse_block_t blk;
+    if (!esp_efuse_find_purpose(purpose, &blk)) continue;
+    uint8_t d[32];
+    if (esp_efuse_read_block(blk, d, 0, 256) != ESP_OK) continue;
+    for (int k = 0; k < 2 && holds[slot] == 0; k++)
+      if (memcmp(d, ALLOWED[k], 32) == 0) holds[slot] = k + 1;
   }
   bool project = false, foreign = false;
   for (int h : holds) {
@@ -151,6 +156,9 @@ void encode(const uint8_t hash[32], uint8_t em[RSA_BYTES]) {
 
 // Sign a SHA-256 hash with the chip's key; the signature big-endian.
 bool sign(const esp_ds_data_t& ds, uint8_t block, const uint8_t hash[32], uint8_t sig[RSA_BYTES]) {
+  // The length the driver copies by sits outside the encrypted parameters: only RSA-3072 (any
+  // other would overrun the 384-byte buffers).
+  if (ds.rsa_length != ESP_DS_RSA_3072) return false;
   alignas(4) static uint8_t em[RSA_BYTES];
   encode(hash, em);
   if (esp_ds_sign(em, &ds, (hmac_key_id_t)block, sig) != ESP_OK) return false;
@@ -348,6 +356,7 @@ int provision(uint8_t* out) {
 }  // namespace
 
 void radioSet(float freq, float bw, uint8_t sf, uint8_t cr, bool ok) {
+  radio.changed_ms = millis();
   radio.ok = ok;
   radio.freq = ok ? freq : 0;
   radio.bw = ok ? bw : 0;
@@ -376,6 +385,9 @@ void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterfa
   load();
   // Signed only with a key, settings the radio confirmed, and a freshness value from the electrodes.
   if (!key.present || !radio.ok || !nonceSet || serial == nullptr) return;
+  // A packet heard before a change of settings can still be waiting to be read: none signed in the
+  // two seconds after one.
+  if (millis() - radio.changed_ms < 2000) return;
   mesh::Packet pkt;
   // Only what MeshCore itself would take (its parser refuses newer payload versions).
   if (len <= 0 || !pkt.readFrom(raw, len) || pkt.getPayloadVer() > PAYLOAD_VER_1) return;
@@ -489,6 +501,7 @@ int command(const uint8_t* frame, int len, uint8_t* out) {
       if (key.present) return identity(out);
       int blk = dsBlock();
       if (blk < 0) return error(out, 7, "this chip has no key");
+      if (!esp_efuse_get_key_dis_read((esp_efuse_block_t)blk)) return error(out, 6, "this chip's key is not read-protected");
       if (incomingParts != (1u << BLOB_PARTS) - 1) return error(out, 0, "parts missing");
       static esp_ds_data_t ds;
       static uint8_t mod[RSA_BYTES];

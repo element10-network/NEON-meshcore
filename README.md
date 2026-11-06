@@ -40,8 +40,12 @@ companion radio for the atom (channels, direct messages, adverts), with Neon's u
 What it cannot prove: the chip has no factory attestation, so the network cannot tell a secured
 Heltec from software pretending to be one at registration. A fake still needs a genuine hotspot, a
 confirmed position, other operators' atoms hearing the same packets, and stays under the caps.
-Older Neon-signed firmware can be written back over a newer one (no anti-rollback yet **(verify**
-whether the Arduino build can carry a secure version**)**).
+Known limits (reviews 2026-11-06): older Neon-signed firmware can be written back over a newer one (no
+anti-rollback yet **(verify** whether the Arduino build can carry a secure version**)**); before the board is locked, the
+atom (untrusted) could burn an eFuse key of its own with the DS purpose, and the radio would then use that key: the
+network cannot tell (the same "no attestation" limit); the Arduino build keeps core dumps in flash (a crash while the key
+is made could leave the HMAC key there, readable only with the flash chip removed); MeshCore's command line stays
+reachable from the board's button and from an admin contact (it touches no Neon state).
 
 ## Build
 
