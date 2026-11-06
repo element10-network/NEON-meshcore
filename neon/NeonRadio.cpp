@@ -13,11 +13,13 @@
 #include "bootloader_random.h"
 #include "esp_efuse.h"
 #include "esp_efuse_table.h"
+#include "nvs_flash.h"
 #include "esp_random.h"
 #include "esp_secure_boot.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "mbedtls/bignum.h"
+#include "mbedtls/platform_util.h"
 #include "mbedtls/rsa.h"
 #include "soc/esp32s3/esp_ds.h"
 #include "soc/esp32s3/esp_hmac.h"
@@ -43,6 +45,24 @@ Key key;
 uint32_t boot = 0;
 uint32_t seq = 0;
 uint8_t nonce[16] = {0};
+bool nonceSet = false;
+struct {
+  bool ok = false;
+  float freq = 0, bw = 0;
+  uint8_t sf = 0, cr = 0;
+} radio;
+// Fingerprints signed in the last seconds: a flood's copies are signed once.
+struct Recent {
+  uint8_t fp[8];
+  uint32_t ms;
+};
+Recent recent[16];
+int recentNext = 0;
+// The parameters blob (ds then modulus) being put back by the atom.
+constexpr int BLOB_LEN = sizeof(esp_ds_data_t) + RSA_BYTES;
+constexpr int BLOB_PARTS = (BLOB_LEN + 127) / 128;
+uint8_t incoming[BLOB_LEN];
+uint32_t incomingParts = 0;  // bit per part received
 
 bool fuse(const esp_efuse_desc_t* field[]) { return esp_efuse_read_field_bit(field); }
 
@@ -58,24 +78,41 @@ int dsBlock() {
 }
 
 // Secure boot trusts only Neon's keys: each of the three digest slots holds one of
-// NEON_KEY_DIGESTS or is revoked. `fix` revokes (for good) any other slot.
+// NEON_KEY_DIGESTS or is revoked. `fix` revokes (for good) the other slots, but only when a slot
+// that stays holds the project key's digest (the first one, the key this firmware is signed with):
+// revoking every slot, or the one the firmware starts with, would leave a board that never starts.
 bool digestsOk(bool fix) {
   static const uint8_t ALLOWED[][32] = NEON_KEY_DIGESTS;
-  const int n = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
+  static_assert(sizeof(ALLOWED) / sizeof(ALLOWED[0]) == 2, "two key digests: the project key and its backup");
+  // What each slot holds: -1 revoked, 0 neither of ours, 1 the project key, 2 the backup key.
+  int holds[3];
   for (unsigned slot = 0; slot < 3; slot++) {
-    if (esp_efuse_get_digest_revoke(slot)) continue;
-    bool ours = false;
-    for (int b = EFUSE_BLK_KEY0; b < EFUSE_BLK_KEY_MAX && !ours; b++) {
+    holds[slot] = 0;
+    if (esp_efuse_get_digest_revoke(slot)) {
+      holds[slot] = -1;
+      continue;
+    }
+    for (int b = EFUSE_BLK_KEY0; b < EFUSE_BLK_KEY_MAX && holds[slot] == 0; b++) {
       if (esp_efuse_get_key_purpose((esp_efuse_block_t)b) !=
           (esp_efuse_purpose_t)(ESP_EFUSE_KEY_PURPOSE_SECURE_BOOT_DIGEST0 + slot))
         continue;
       uint8_t d[32];
       if (esp_efuse_read_block((esp_efuse_block_t)b, d, 0, 256) != ESP_OK) continue;
-      for (int k = 0; k < n && !ours; k++) ours = memcmp(d, ALLOWED[k], 32) == 0;
+      for (int k = 0; k < 2 && holds[slot] == 0; k++)
+        if (memcmp(d, ALLOWED[k], 32) == 0) holds[slot] = k + 1;
     }
-    if (ours) continue;
-    if (!fix || esp_efuse_set_digest_revoke(slot) != ESP_OK || !esp_efuse_get_digest_revoke(slot)) return false;
   }
+  bool project = false, foreign = false;
+  for (int h : holds) {
+    project |= h == 1;
+    foreign |= h == 0;
+  }
+  if (!project) return false;  // never revoke anything then
+  if (!foreign) return true;
+  if (!fix) return false;
+  for (unsigned slot = 0; slot < 3; slot++)
+    if (holds[slot] == 0 && (esp_efuse_set_digest_revoke(slot) != ESP_OK || !esp_efuse_get_digest_revoke(slot)))
+      return false;
   return true;
 }
 
@@ -114,7 +151,7 @@ void encode(const uint8_t hash[32], uint8_t em[RSA_BYTES]) {
 
 // Sign a SHA-256 hash with the chip's key; the signature big-endian.
 bool sign(const esp_ds_data_t& ds, uint8_t block, const uint8_t hash[32], uint8_t sig[RSA_BYTES]) {
-  static uint8_t em[RSA_BYTES];
+  alignas(4) static uint8_t em[RSA_BYTES];
   encode(hash, em);
   if (esp_ds_sign(em, &ds, (hmac_key_id_t)block, sig) != ESP_OK) return false;
   reverse(sig, RSA_BYTES);
@@ -124,7 +161,7 @@ bool sign(const esp_ds_data_t& ds, uint8_t block, const uint8_t hash[32], uint8_
 // A fresh signature verifies with the modulus: the parameters and the chip's key belong together.
 bool selfTest(const esp_ds_data_t& ds, uint8_t block, const uint8_t mod[RSA_BYTES]) {
   uint8_t hash[32];
-  static uint8_t sig[RSA_BYTES];
+  alignas(4) static uint8_t sig[RSA_BYTES];
   esp_fill_random(hash, 32);
   mbedtls_rsa_context pub;
   mbedtls_rsa_init(&pub, MBEDTLS_RSA_PKCS_V15, 0);
@@ -157,6 +194,8 @@ void load() {
     key.present = read && esp_efuse_get_key_dis_read((esp_efuse_block_t)blk) &&
                   selfTest(key.ds, key.block, key.modulus);
     key.lost = !key.present;
+    // A power cut between the key's burn and this lock: done now.
+    if (key.present) burn(ESP_EFUSE_WR_DIS_RD_DIS);
   }
   p.end();
 }
@@ -202,19 +241,27 @@ int identity(uint8_t* out) {
 // generation): the atom waits for the answer.
 int provision(uint8_t* out) {
   if (key.present) return identity(out);
-  if (key.lost) return error(out, 8, "this chip's key was made before and its parameters are gone: it cannot be used again");
+  if (key.lost) return error(out, 8, "this chip's key parameters are missing: put back the atom's copy (SUB_BLOB_PUT)");
   if (dsBlock() >= 0) return error(out, 8, "this chip already has a key");
   if (!esp_secure_boot_enabled())
     return error(out, 1, "secure boot is off: flash the Neon bootloader first");
-  if (!digestsOk(true)) return error(out, 9, "secure boot trusts a key that is not Neon's");
-  if (!burn(ESP_EFUSE_HARD_DIS_JTAG) || !burn(ESP_EFUSE_DIS_USB_JTAG) || !burn(ESP_EFUSE_SOFT_DIS_JTAG) ||
-      !burn(ESP_EFUSE_DIS_DIRECT_BOOT) ||
-      !(fuse(ESP_EFUSE_DIS_DOWNLOAD_MODE) || burn(ESP_EFUSE_ENABLE_SECURITY_DOWNLOAD)))
-    return error(out, 2, "could not turn JTAG, direct boot and full download mode off");
+  // Everything that can refuse is checked before anything is burnt.
   // Read protection must still be possible (the Neon bootloader leaves it so).
   if (fuse(ESP_EFUSE_WR_DIS_RD_DIS)) return error(out, 3, "read protection is locked on this chip: no key can be kept secret");
   esp_efuse_block_t blk = esp_efuse_find_unused_key_block();
   if (blk == EFUSE_BLK_KEY_MAX) return error(out, 3, "no free eFuse key block");
+  if (!digestsOk(true)) return error(out, 9, "secure boot trusts a key that is not Neon's");
+  // SOFT_DIS_JTAG is a 3-bit field (the Neon bootloader burns all three).
+  uint8_t soft = 0;
+  esp_efuse_read_field_blob(ESP_EFUSE_SOFT_DIS_JTAG, &soft, 3);
+  if (soft == 0) {
+    uint8_t all = 7;
+    esp_efuse_write_field_blob(ESP_EFUSE_SOFT_DIS_JTAG, &all, 3);
+    esp_efuse_read_field_blob(ESP_EFUSE_SOFT_DIS_JTAG, &soft, 3);
+  }
+  if (soft == 0 || !burn(ESP_EFUSE_HARD_DIS_JTAG) || !burn(ESP_EFUSE_DIS_USB_JTAG) || !burn(ESP_EFUSE_DIS_DIRECT_BOOT) ||
+      !(fuse(ESP_EFUSE_DIS_DOWNLOAD_MODE) || burn(ESP_EFUSE_ENABLE_SECURITY_DOWNLOAD)))
+    return error(out, 2, "could not turn JTAG, direct boot and full download mode off");
 
   static esp_ds_p_data_t p;
   memset(&p, 0, sizeof(p));
@@ -248,11 +295,11 @@ int provision(uint8_t* out) {
     ok = esp_ds_encrypt_params(&key.ds, iv, &p, hmac) == ESP_OK;
   }
   // The private exponent leaves RAM now, whatever happens below.
-  memset(&p, 0, sizeof(p));
+  mbedtls_platform_zeroize(&p, sizeof(p));
   mbedtls_rsa_free(&rsa);
   mbedtls_mpi_free(&N); mbedtls_mpi_free(&D); mbedtls_mpi_free(&rr); mbedtls_mpi_free(&inv); mbedtls_mpi_free(&m32);
   if (!ok) {
-    memset(hmac, 0, sizeof(hmac));
+    mbedtls_platform_zeroize(hmac, sizeof(hmac));
     return error(out, 4, "key generation failed");
   }
 
@@ -267,15 +314,16 @@ int provision(uint8_t* out) {
        pr.getBytes("mod", mod_back, RSA_BYTES) == RSA_BYTES && memcmp(mod_back, key.modulus, RSA_BYTES) == 0;
   pr.end();
   if (!ok) {
-    memset(hmac, 0, sizeof(hmac));
+    mbedtls_platform_zeroize(hmac, sizeof(hmac));
     return error(out, 5, "the key could not be saved");
   }
 
   // Burnt read-protected: only the DS peripheral can use it from now on.
+  // esp_efuse_write_key burns the key, its purpose and their read and write protection in one go.
   ok = esp_efuse_write_key(blk, ESP_EFUSE_KEY_PURPOSE_HMAC_DOWN_DIGITAL_SIGNATURE, hmac, sizeof(hmac)) == ESP_OK;
-  memset(hmac, 0, sizeof(hmac));
-  if (!esp_efuse_get_key_dis_read(blk)) esp_efuse_set_key_dis_read(blk);
-  if (!ok || !esp_efuse_get_key_dis_read(blk)) {
+  mbedtls_platform_zeroize(hmac, sizeof(hmac));
+  if (!ok) return error(out, 6, "the key could not be burnt: restart the radio and try again");
+  if (!esp_efuse_get_key_dis_read(blk)) {
     key.lost = true;
     return error(out, 6, "the key could not be stored read-protected in the chip");
   }
@@ -287,14 +335,47 @@ int provision(uint8_t* out) {
     return error(out, 7, "the chip's signature did not verify");
   }
   key.present = true;
+  // A clean start in a few seconds, after the answer is sent (the random source's ADC settings
+  // are left changed by bootloader_random_disable).
+  static esp_timer_handle_t restart = nullptr;
+  esp_timer_create_args_t a = {};
+  a.callback = [](void*) { esp_restart(); };
+  a.name = "neon-restart";
+  if (esp_timer_create(&a, &restart) == ESP_OK) esp_timer_start_once(restart, 3000000);
   return identity(out);
 }
 
 }  // namespace
 
-void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterface* serial, RadioParams radio) {
+void radioSet(float freq, float bw, uint8_t sf, uint8_t cr, bool ok) {
+  radio.ok = ok;
+  radio.freq = ok ? freq : 0;
+  radio.bw = ok ? bw : 0;
+  radio.sf = ok ? sf : 0;
+  radio.cr = ok ? cr : 0;
+}
+
+bool eraseNvsKeepingKey() {
+  static esp_ds_data_t ds;
+  static uint8_t mod[RSA_BYTES];
+  Preferences p;
+  p.begin(NS, true);
+  bool had = p.getBytes("ds", &ds, sizeof(ds)) == sizeof(ds) && p.getBytes("mod", mod, RSA_BYTES) == RSA_BYTES;
+  uint32_t b = p.getUInt("boot", 0);
+  p.end();
+  if (nvs_flash_erase() != ESP_OK || nvs_flash_init() != ESP_OK) return false;
+  p.begin(NS, false);
+  bool ok = p.putUInt("boot", b) == 4;
+  if (had)
+    ok = p.putBytes("ds", &ds, sizeof(ds)) == sizeof(ds) && p.putBytes("mod", mod, RSA_BYTES) == RSA_BYTES && ok;
+  p.end();
+  return ok;
+}
+
+void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterface* serial) {
   load();
-  if (!key.present || serial == nullptr || !serial->isConnected()) return;
+  // Signed only with a key, settings the radio confirmed, and a freshness value from the electrodes.
+  if (!key.present || !radio.ok || !nonceSet || serial == nullptr) return;
   mesh::Packet pkt;
   // Only what MeshCore itself would take (its parser refuses newer payload versions).
   if (len <= 0 || !pkt.readFrom(raw, len) || pkt.getPayloadVer() > PAYLOAD_VER_1) return;
@@ -310,6 +391,12 @@ void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterfa
     h.update(pkt.payload, pkt.payload_len);
     h.finalize(fp, 32);
   }
+  uint32_t now = millis();
+  for (const Recent& r : recent)
+    if (memcmp(r.fp, fp, 8) == 0 && now - r.ms < 10000) return;
+  memcpy(recent[recentNext].fp, fp, 8);
+  recent[recentNext].ms = now;
+  recentNext = (recentNext + 1) % 16;
   uint8_t rx[RX_LEN];
   int i = 0;
   rx[i++] = PUSH_RX;
@@ -329,6 +416,13 @@ void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterfa
   rx[i++] = radio.sf;
   rx[i++] = radio.cr;
   memcpy(rx + i, nonce, 16); i += 16;
+  // The whole packet as heard (header, path, transport codes): which copy of a flood this was.
+  {
+    SHA256 h;
+    h.update(raw, len);
+    h.finalize(rx + i, 32);
+    i += 32;
+  }
 
   uint8_t hash[32];
   {
@@ -337,7 +431,7 @@ void onRx(float snr, float rssi, const uint8_t raw[], int len, BaseSerialInterfa
     h.update(rx + 1, RX_LEN - 1);
     h.finalize(hash, 32);
   }
-  static uint8_t sig[RSA_BYTES];
+  alignas(4) static uint8_t sig[RSA_BYTES];
   if (!sign(key.ds, key.block, hash, sig)) return;
   serial->writeFrame(rx, RX_LEN);
   uint8_t part[6 + 128];
@@ -368,7 +462,53 @@ int command(const uint8_t* frame, int len, uint8_t* out) {
     case SUB_NONCE:
       if (len < 18) return error(out, 0, "16 bytes");
       memcpy(nonce, frame + 2, 16);
+      nonceSet = true;
       return identity(out);
+    case SUB_BLOB_GET: {
+      if (!key.present) return error(out, 7, "no key");
+      if (len < 3 || frame[2] >= BLOB_PARTS) return error(out, 0, "no such part");
+      int off = frame[2] * 128, n = BLOB_LEN - off < 128 ? BLOB_LEN - off : 128;
+      out[0] = RESP_BLOB;
+      out[1] = frame[2];
+      out[2] = BLOB_PARTS;
+      for (int k = 0; k < n; k++) {
+        int at = off + k;
+        out[3 + k] = at < (int)sizeof(esp_ds_data_t) ? ((const uint8_t*)&key.ds)[at] : key.modulus[at - sizeof(esp_ds_data_t)];
+      }
+      return 3 + n;
+    }
+    case SUB_BLOB_PUT: {
+      if (len < 3 || frame[2] >= BLOB_PARTS) return error(out, 0, "no such part");
+      int off = frame[2] * 128, n = BLOB_LEN - off < 128 ? BLOB_LEN - off : 128;
+      if (len < 3 + n) return error(out, 0, "part too short");
+      memcpy(incoming + off, frame + 3, n);
+      incomingParts |= 1u << frame[2];
+      return identity(out);
+    }
+    case SUB_BLOB_COMMIT: {
+      if (key.present) return identity(out);
+      int blk = dsBlock();
+      if (blk < 0) return error(out, 7, "this chip has no key");
+      if (incomingParts != (1u << BLOB_PARTS) - 1) return error(out, 0, "parts missing");
+      static esp_ds_data_t ds;
+      static uint8_t mod[RSA_BYTES];
+      memcpy(&ds, incoming, sizeof(ds));
+      memcpy(mod, incoming + sizeof(ds), RSA_BYTES);
+      incomingParts = 0;
+      // Taken only if it belongs to this chip's key.
+      if (!selfTest(ds, blk - EFUSE_BLK_KEY0, mod)) return error(out, 6, "these parameters are not this chip's");
+      Preferences pr;
+      pr.begin(NS, false);
+      bool ok = pr.putBytes("ds", &ds, sizeof(ds)) == sizeof(ds) && pr.putBytes("mod", mod, RSA_BYTES) == RSA_BYTES;
+      pr.end();
+      if (!ok) return error(out, 5, "could not be saved");
+      key.ds = ds;
+      memcpy(key.modulus, mod, RSA_BYTES);
+      key.block = blk - EFUSE_BLK_KEY0;
+      key.present = true;
+      key.lost = false;
+      return identity(out);
+    }
     default:
       return error(out, 0, "unknown subcommand");
   }

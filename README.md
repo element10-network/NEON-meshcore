@@ -49,28 +49,45 @@ whether the Arduino build can carry a secure version**)**).
 ./build.sh            # MeshCore at MESHCORE_COMMIT + neon/ -> out/ (unsigned)
 ```
 
-Needs PlatformIO (`pip install platformio`). `neon/companion_radio.patch` is the only change to
+Needs PlatformIO (in a venv: `python3 -m venv ~/pio && ~/pio/bin/pip install platformio`). `neon/companion_radio.patch` is the only change to
 MeshCore's own files (two hooks, behind `NEON_RADIO`); `neon/NeonRadio.cpp` is the rest. MeshCore's
 private key import and export are compiled out.
 
 ## The firmware keys (hq)
 
 Two keys, made once on hq: the project's key (stays on hq) and a backup key (moved offline at once,
-brought back only to sign a bootloader or to replace a lost or stolen project key). Every secured
-radio trusts exactly these two, for good.
+brought back only to sign a bootloader). Every secured radio trusts exactly these two, for good.
+esptool 4.8.1 in a venv:
 
 ```
-sudo /root/esptool/bin/espsecure.py generate_signing_key --version 2 --scheme rsa3072 /root/neon-firmware-backup-key.pem && sudo chmod 600 /root/neon-firmware-backup-key.pem
+sudo apt-get install -y python3-venv && sudo python3 -m venv /root/esptool && sudo /root/esptool/bin/pip install esptool==4.8.1
 ```
 
-Their digests (public) go into `neon/key-digests.hex`, one per line; the build refuses without it:
+The keys (`generate_signing_key` refuses to overwrite one that exists):
 
 ```
-for k in /root/neon-firmware-key.pem /root/neon-firmware-backup-key.pem; do sudo /root/esptool/bin/espsecure.py digest_sbv2_public_key --keyfile $k -o /tmp/d.bin >/dev/null && od -An -tx1 -v /tmp/d.bin | tr -d ' \n' && echo; done; rm -f /tmp/d.bin
+sudo /root/esptool/bin/espsecure.py generate_signing_key --version 2 --scheme rsa3072 /root/neon-firmware-key.pem && sudo /root/esptool/bin/espsecure.py generate_signing_key --version 2 --scheme rsa3072 /root/neon-firmware-backup-key.pem && sudo chmod 600 /root/neon-firmware-key.pem /root/neon-firmware-backup-key.pem
 ```
 
-Signing a build: `./sign.sh /root/neon-firmware-key.pem /root/neon-firmware-backup-key.pem out/ signed/`
-(signs, verifies, writes the flash layout and SHA256SUMS).
+Their digests (public), the project key first: these two lines go into `neon/key-digests.hex` on the
+machine that runs build.sh. build.sh refuses without exactly two, and sign.sh refuses keys that are
+not these two, in this order:
+
+```
+sudo sh -c 'set -e; for k in /root/neon-firmware-key.pem /root/neon-firmware-backup-key.pem; do /root/esptool/bin/espsecure.py digest_sbv2_public_key --keyfile $k -o /root/d.bin >/dev/null; od -An -tx1 -v /root/d.bin | tr -d " \n"; echo; done; rm -f /root/d.bin'
+```
+
+Signing a build (on hq, with build.sh's `out/` copied there):
+`sudo ./sign.sh /root/neon-firmware-key.pem /root/neon-firmware-backup-key.pem out/ signed/`. It checks
+the unsigned files against build.sh's list, refuses files signed before, checks both keys against
+`key-digests.hex`, signs, verifies and writes the flash layout and SHA256SUMS. Then move the backup key
+offline again.
+
+## Flashing (until the panel does it)
+
+On the atom, with esptool installed and neond stopped (it holds the port):
+`./flash.sh signed/ /dev/ttyUSB0`. It keeps the signed bootloader's header as it is and writes the
+bootloader last.
 
 ## Licence
 

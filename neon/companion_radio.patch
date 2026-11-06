@@ -1,5 +1,31 @@
+diff --git a/examples/companion_radio/DataStore.cpp b/examples/companion_radio/DataStore.cpp
+index 06c56a7..7a43953 100644
+--- a/examples/companion_radio/DataStore.cpp
++++ b/examples/companion_radio/DataStore.cpp
+@@ -1,5 +1,8 @@
+ #include <Arduino.h>
+ #include "DataStore.h"
++#ifdef NEON_RADIO
++#include <helpers/neon/NeonRadio.h>
++#endif
+ 
+ #if defined(EXTRAFS) || defined(QSPIFLASH)
+   #define MAX_BLOBRECS 100
+@@ -174,7 +177,12 @@ bool DataStore::formatFileSystem() {
+   return LittleFS.format();
+ #elif defined(ESP32)
+   bool fs_success = ((fs::SPIFFSFS *)_fs)->format();
++#ifdef NEON_RADIO
++  // The secured radio's key parameters survive a factory reset (they are useless without this chip).
++  esp_err_t nvs_err = neon::eraseNvsKeepingKey() ? ESP_OK : ESP_FAIL;
++#else
+   esp_err_t nvs_err = nvs_flash_erase(); // no need to reinit, will be done by reboot
++#endif
+   return fs_success && (nvs_err == ESP_OK);
+ #else
+   #error "need to implement format()"
 diff --git a/examples/companion_radio/MyMesh.cpp b/examples/companion_radio/MyMesh.cpp
-index f32ea67..6b26362 100644
+index f32ea67..9d8fef7 100644
 --- a/examples/companion_radio/MyMesh.cpp
 +++ b/examples/companion_radio/MyMesh.cpp
 @@ -5,6 +5,9 @@
@@ -17,12 +43,24 @@ index f32ea67..6b26362 100644
  
  void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 +#ifdef NEON_RADIO
-+  neon::onRx(snr, rssi, raw, len, _serial, neon::RadioParams{_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr});
++  neon::onRx(snr, rssi, raw, len, _serial);
 +#endif
    if (_serial->isConnected() && len + 3 <= MAX_FRAME_SIZE) {
      int i = 0;
      out_frame[i++] = PUSH_CODE_LOG_RX_DATA;
-@@ -2042,6 +2048,10 @@ void MyMesh::handleCmdFrame(size_t len) {
+@@ -1115,6 +1121,11 @@ void MyMesh::handleCmdFrame(size_t len) {
+     memcpy(&out_frame[i], _prefs.node_name, tlen);
+     i += tlen;
+     _serial->writeFrame(out_frame, i);
++#ifdef NEON_RADIO
++  } else if (cmd_frame[0] == CMD_RUN_CLI_COMMAND) {
++    // No command line over USB on a secured radio: the host is not trusted.
++    writeDisabledFrame();
++#endif
+   } else if (cmd_frame[0] == CMD_RUN_CLI_COMMAND && len >= 3) { // V14+
+     int i = 1;
+     char *text = (char *)&cmd_frame[i];
+@@ -2042,6 +2053,10 @@ void MyMesh::handleCmdFrame(size_t len) {
        memcpy(&out_frame[i], &r->upper_freq, 4); i += 4;
      }
      _serial->writeFrame(out_frame, i);
@@ -33,3 +71,52 @@ index f32ea67..6b26362 100644
    } else if (cmd_frame[0] == CMD_SEND_RAW_PACKET && len >= 4) {
      auto pkt = obtainNewPacket();
      if (pkt) {
+diff --git a/src/helpers/CommonRadioPrefs.cpp b/src/helpers/CommonRadioPrefs.cpp
+index 41b1799..470f447 100644
+--- a/src/helpers/CommonRadioPrefs.cpp
++++ b/src/helpers/CommonRadioPrefs.cpp
+@@ -38,7 +38,8 @@ bool CommonRadioPrefs::handleCommand(const char* command, uint32_t sender_timest
+   }
+   if (memcmp(command, "set radio ", 10) == 0) {
+     char tmp[132];
+-    strcpy(tmp, &command[10]);
++    strncpy(tmp, &command[10], sizeof(tmp) - 1);
++    tmp[sizeof(tmp) - 1] = 0;
+     const char *parts[4];
+     int num = mesh::Utils::parseTextParts(tmp, parts, 4);
+     float freq  = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
+diff --git a/src/helpers/radiolib/CustomSX1262Wrapper.h b/src/helpers/radiolib/CustomSX1262Wrapper.h
+index be31447..049fc8c 100644
+--- a/src/helpers/radiolib/CustomSX1262Wrapper.h
++++ b/src/helpers/radiolib/CustomSX1262Wrapper.h
+@@ -3,6 +3,9 @@
+ #include "CustomSX1262.h"
+ #include "RadioLibWrappers.h"
+ #include "SX126xReset.h"
++#ifdef NEON_RADIO
++#include <helpers/neon/NeonRadio.h>
++#endif
+ 
+ #ifndef USE_SX1262
+ #define USE_SX1262
+@@ -13,10 +16,20 @@ public:
+   CustomSX1262Wrapper(CustomSX1262& radio, mesh::MainBoard& board) : RadioLibWrapper(radio, board) { }
+ 
+   void setParams(float freq, float bw, uint8_t sf, uint8_t cr) override {
++#ifdef NEON_RADIO
++    // Receptions are signed with the settings the radio confirmed, none while unknown.
++    neon::radioSet(0, 0, 0, 0, false);
++    bool ok = ((CustomSX1262 *)_radio)->setFrequency(freq) == RADIOLIB_ERR_NONE;
++    ok = ((CustomSX1262 *)_radio)->setSpreadingFactor(sf) == RADIOLIB_ERR_NONE && ok;
++    ok = ((CustomSX1262 *)_radio)->setBandwidth(bw) == RADIOLIB_ERR_NONE && ok;
++    ok = ((CustomSX1262 *)_radio)->setCodingRate(cr) == RADIOLIB_ERR_NONE && ok;
++    neon::radioSet(freq, bw, sf, cr, ok);
++#else
+     ((CustomSX1262 *)_radio)->setFrequency(freq);
+     ((CustomSX1262 *)_radio)->setSpreadingFactor(sf);
+     ((CustomSX1262 *)_radio)->setBandwidth(bw);
+     ((CustomSX1262 *)_radio)->setCodingRate(cr);
++#endif
+     updatePreamble(sf);
+     PacketMillis pm = calcMaxPacketMillis(sf, bw, cr, preambleLengthForSF(sf));
+     ((CustomSX1262 *)_radio)->setPreambleMillis(pm.preambleMillis);
