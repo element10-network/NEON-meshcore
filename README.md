@@ -19,8 +19,10 @@ companion radio for the atom (channels, direct messages, adverts), with Neon's u
 
 ## How it fits together
 
-1. **The atom flashes it** (panel, to come): the signed bootloader, partition table and firmware, over
-   the USB cable the Heltec is already on.
+1. **The atom flashes it** (panel, neond 0.4.193 and later: Reach → MeshCore → Radio firmware (Neon
+   MeshCore)), over the USB cable the Heltec is already on: *Install Neon MeshCore firmware* writes the
+   firmware and boot_app0 only (the board's own bootloader and partition table stay, nothing is locked);
+   *Lock this radio* (LOCK typed) writes them again with the signed bootloader, then provisions the key.
 2. **First start:** the bootloader checks the firmware's signature, burns the digests of the Neon firmware
    key and its offline backup into the chip, revokes the third slot, turns secure boot on, turns JTAG off
    and limits USB download to flash writes. From here the board is locked.
@@ -97,7 +99,7 @@ a release with `SHA256SUMS` and `radio.txt`. The atom's panel flashes and locks 
 The bootloader is signed again only when `bootloader/` changes: build, commit the new
 `release/bootloader-unsigned.bin`, sign it on hq with both keys (`sign.sh`), commit `release/bootloader.bin`.
 
-## Flashing (until the panel does it)
+## Flashing by hand (without the panel)
 
 On the atom, neond stopped for the whole procedure (it holds the port, and gives up on a radio that
 did not answer until it is unplugged), esptool 4.8.1 in `/root/esptool` as on hq:
