@@ -7,7 +7,7 @@
 - Before pushing: `./build.sh` must succeed (PlatformIO). Change MeshCore's own files only through
   `neon/companion_radio.patch` (regenerate it with `git diff` in `build/MeshCore`), keep the pin in
   `MESHCORE_COMMIT`.
-- Never commit keys (`*.pem`). The firmware key lives only on hq. Never flash a Heltec with a
+- Never commit keys (`*.pem`). The firmware key is a GitHub secret (`NEON_FIRMWARE_KEY`) of the Radio workflow, used only by its signing job (owner 2026-11-10). Never flash a Heltec with a
   bootloader signed by any other key: the first start burns that key's digest for good.
 - Mark anything not yet confirmed on a real Heltec with **(verify)**.
 - Always give the owner full, copy-paste commands joined with `&&`, one line per machine.
