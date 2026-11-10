@@ -39,6 +39,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The key signs what is on main, nothing else (a run started from another branch would sign
+      # that branch's workflow and code).
+      - name: Only from main
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "run it from main, not $GITHUB_REF"; exit 1; }
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
