@@ -36,6 +36,9 @@ jobs:
   sign:
     needs: build
     runs-on: ubuntu-latest
+    # The key is the "signing" environment's, which only main may use (owner 2026-11-12): the
+    # check below is in this file, which a run from another branch would bring in its own version.
+    environment: signing
     permissions:
       contents: write
     steps:
