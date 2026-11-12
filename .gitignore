@@ -5,3 +5,4 @@ signed/
 *.pem
 bootloader/sdkconfig.bootloader
 bootloader/.pio/
+__pycache__/
