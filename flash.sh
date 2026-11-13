@@ -8,7 +8,7 @@
 # port: /dev/ttyUSB0 by default.
 #
 # The first time, this locks the board for good when it next starts (README, "Warning"). Files are
-# checked against SHA256SUMS; the firmware goes first and the bootloader last (an interrupted write
+# checked against SHA256SUMS, and before a lock the bootloader against the project's keys; the firmware goes first and the bootloader last (an interrupted write
 # leaves a board that still starts its old bootloader); the signed bootloader's header is kept as it
 # is (--flash_mode/freq/size keep: esptool would otherwise rewrite it and break its signature).
 # neond must not hold the port: stop it first (sudo systemctl stop neond).
@@ -17,6 +17,16 @@ set -eu
 stage=$1; dir=$2; port=${3:-/dev/ttyUSB0}
 ET=${ESPTOOL:-esptool.py}
 (cd "$dir" && sha256sum -c --quiet SHA256SUMS) || { echo "the signed files do not match their SHA256SUMS" >&2; exit 1; }
+# Before a lock: the bootloader must be this repository's release/bootloader.bin, checked to be signed
+# by exactly the keys in neon/key-digests.hex (SHA256SUMS alone says nothing about who signed it,
+# and the first start burns its keys for good).
+if [ "$stage" = lock ]; then
+    top=$(cd "$(dirname "$0")" && pwd)
+    cmp -s "$dir/bootloader.bin" "$top/release/bootloader.bin" ||
+        { echo "$dir/bootloader.bin is not release/bootloader.bin: not locking" >&2; exit 1; }
+    (cd "$top" && python3 release/check-bootloader.py "${ESPSECURE:-espsecure.py}") ||
+        { echo "the bootloader's signature keys are not the project's: not locking" >&2; exit 1; }
+fi
 unset ESPTOOL_FM ESPTOOL_FF ESPTOOL_FS
 common="--chip esp32s3 --port $port --baud 460800 --before default_reset --after no_reset"
 keep="--flash_mode keep --flash_freq keep --flash_size keep"
